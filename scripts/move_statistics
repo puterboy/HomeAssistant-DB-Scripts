@@ -1,0 +1,254 @@
+#!/bin/bash
+#===============================================================================
+# DESCRIPTION:
+# Move statistic metadata_id's from: (X1, X2,..., Xn) --> (Y1, Y2,..., Yn)
+#
+# Moves statistic metadata_ids in tables:
+#    statistics_meta (id)
+#    statistics (metadata_id)
+#    statistics_short_term (metadata_id)
+#
+#===============================================================================
+# USAGE:
+#    Usage: move_statistics -i X1 X2... Xn -o Y1 Y2... Yn
+#
+#===============================================================================
+# VERSION: 0.8.4
+#
+#===============================================================================
+# CHANGELOG
+#     0.5 (June 2024)
+#      - First official release
+#     0.6 (July 2024)
+#     0.8 (August 2024)
+#      - Minor cleanup
+#     0.8.1 (August 2024)
+#      - Minor cleanup
+#     0.8.2 (December 2024)
+#      - Added options for custom db and backup directory
+#      - Bug fixes
+#     0.8.4 (July 2024)
+#      - Optimized sqlite3 UPDATE statement
+#
+#===============================================================================
+# AUTHOR:
+#    Jeff Kosowsky
+#    Copyright August 2024
+#
+#===============================================================================
+#### VARIABLES
+
+BASE=/homeassistant
+BASE="${BASE%%/}"
+
+DB="home-assistant_v2.db"
+DB="$BASE/$DB"
+
+##Choose to undelete one of the following
+#BACKDIR="" #Set to blank if you don't want to backup data - not advisable
+BACKDIR="/tmp/backups" #Temporary backup directory, deleted upon system reboot
+#BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *included* in standard HA backups
+
+#===============================================================================
+#### FUNCTIONS
+
+usage() {
+    PROG=${0##*/}
+    cat <<EOF >&2
+Usage: $PROG -i X1 X2... Xn -o Y1 Y2... Yn
+EOF
+    exit 1
+    }
+
+print_exit() {
+    [ -n "$RESTART_HA" ] && echo "*** Don't forget to restart home assistant (ha core start)"
+    exit 0
+}
+
+DATE="$(date +%Y%m%d-%H%M%S)"
+declare -A BACKUPS
+backup() {
+    [ -z "$BACKDIR" ] && return #Don't backup
+    SRC="$1"
+    IGNORE_EXIST="$2"
+    BACK="${BACKDIR}/${SRC##*/}-$DATE"
+    if ! [ -e "$SRC" ]; then
+       echo "ERROR: Can't back up '$SRC' to '$BACK' since '$SRC' DOESN'T exist"
+    elif [ -z $IGNORE_EXIST ] && [ -e "$BACK" ]; then
+	echo "ERROR: Can't back up '$SRC' to '$BACK' since '$BACK' ALREADY exists"
+    else
+	cp -a "$SRC" "$BACK"
+	echo "...'$SRC' backed up to '$BACK"
+	BACKUPS["$SRC"]="$BACK"
+    fi
+}
+
+restore_backups() {
+    for SRC in ${!BACKUPS[@]}; do
+	BACK="${BACKUPS[$SRC]}"
+	if [ -e "$BACK" ]; then
+	    mv -f "$BACK" "$SRC"
+	    echo "...'$BACK' restored to '$SRC'"
+	else
+	    echo "ERROR: Can't restore '$BACK' to '$SRC' since '$BACK' DOESN'T exist"
+	fi
+    done
+}
+
+#===============================================================================
+#### PARSE OPTIONS
+
+OPTi='-i'
+OPTo='-o'
+declare -a INSTATES OUTSTATES
+declare -A UNIQ
+while [ -n "$1" ]; do
+    case "$1" in    
+    	$OPTi)	OPT=i
+		unset OPTi
+		index=0
+		STATES=INSTATES
+		shift
+		;;
+	$OPTo) OPT=o
+	       unset OPTo
+	       index=0
+	       STATES=OUTSTATES
+	       shift
+	       ;;
+	[0-9]*) declare "${STATES}[$index]=$1" #Indirect referencing
+		((index++))
+		if [ -n "${UNIQ[$1]}" ]; then
+		    echo "Error: Can't have duplicate metadata_id's"
+		    exit 1
+		fi
+		UNIQ[$1]=$1
+		shift
+		;;
+	-d) shift
+	   DB="$1"
+	   shift
+	   ;;
+	-b) shift
+	   BACKDIR="$1"
+	   shift
+	   ;;
+	-h) usage
+	   ;;
+	*) usage
+	   ;;
+    esac
+done
+
+if [ ${#INSTATES[@]} -eq 0 -o ${#INSTATES[@]} -ne ${#OUTSTATES[@]} ]; then
+    echo "Error: must have same (positive) number of input and output metadata_id's"
+    exit 1
+fi
+
+if ! [ -f "$DB" ]; then
+    echo "Error: Can't find database file '$DB'"
+    exit 2
+fi
+
+if [ -n "$BACKDIR" ]; then
+    BACKDIR=${BACKDIR%%+(/)} #Remove all trailing slashes
+    mkdir -p "$BACKDIR" || exit 3
+fi
+
+#===============================================================================
+#### Sanity Checks
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Must be root to run!"
+    exit 1
+fi
+
+#Stop Home Assistant before querying & changing databases if HA running and operating on live database
+if `which ha >/dev/null` && [ "$(readlink -f "$DB")" = "$(readlink -f "/homeassistant/home-assistant_v2.db")" ]; then
+   ha core status >&/dev/null
+   if [ $? -ne 1 ]; then #Not stopped so presumably running
+       echo "Stopping home assistant..."
+       ha core stop >&/dev/null
+       if [ $? -ne 0 ]; then
+	   echo "Error: Couldn't stop home assistant..."
+	   exit 4
+       fi
+       RESTART_HA=1
+   fi
+fi
+
+numstates=($(for id in ${OUTSTATES[@]}; do
+		 echo "SELECT 1 FROM statistics_meta WHERE id = $id LIMIT 1;"
+		 echo "SELECT 1 FROM statistics WHERE metadata_id = $id LIMIT 1;"
+		 echo "SELECT 1 FROM statistics_short_term WHERE metadata_id = $id LIMIT 1;"
+	     done | sqlite3 "$DB"))
+
+if [ ${#numstates[@]} -ne 0 ]; then
+   echo "Error: some of the intended output metadata_id's are already in use!" 2>&1
+   exit 5
+fi
+
+numstates=($(for id in ${INSTATES[@]}; do
+		 echo "SELECT 1 FROM statistics_meta WHERE id = $id LIMIT 1;"
+	     done | sqlite3 "$DB"))
+
+if [ ${#numstates[@]} -ne ${#INSTATES[@]}  ]; then
+   echo "Error: Some of the listed input metadata_id's don't exist" 2>&1
+   exit 6
+fi
+
+#===============================================================================
+#### Move metadata_id's
+
+backup "$DB"
+echo "Number of entries moved in 'statistics' and 'statistics_short_term' table:"
+for ((i=0; i<${#INSTATES[@]}; i++)); do
+    sqlite3 "$DB" "BEGIN TRANSACTION;
+    	    	     UPDATE statistics_meta 
+		       SET id = '${OUTSTATES[$i]}'
+		       WHERE id = '${INSTATES[$i]}';
+                   COMMIT;"
+
+    if [ $? -ne 0 ]; then #Error - unwind & exit
+	echo "Error: ${INSTATES[$i]}->${OUTSTATES[$i]}: Failed to change statistics 'metadata_id', unwinding..."
+	#restore_backups #No need to restore backups because if fails won't commit
+	exit 7
+    fi
+    NUM=$(sqlite3 "$DB" "
+    		  PRAGMA synchronous = NORMAL;
+		  PRAGMA temp_store = MEMORY;
+		  PRAGMA foreign_keys = OFF;
+
+		  BEGIN TRANSACTION;
+		    UPDATE statistics 
+		      SET metadata_id = '${OUTSTATES[$i]}'
+		      WHERE metadata_id = '${INSTATES[$i]}';
+		    SELECT changes();
+    		  COMMIT;
+	 ")    
+    if [ $? -ne 0 ]; then #Error - unwind & exit
+	echo "Error: ${INSTATES[$i]}->${OUTSTATES[$i]}: Failed to update 'statistics' entries, unwinding..."
+	restore_backups
+	exit 8
+    fi    
+    NUM_SHORT=$(sqlite3 "$DB" "
+    		  PRAGMA synchronous = NORMAL;
+		  PRAGMA temp_store = MEMORY;
+		  PRAGMA foreign_keys = OFF;
+
+		  BEGIN TRANSACTION;
+		    UPDATE statistics_short_term
+		      SET metadata_id = '${OUTSTATES[$i]}'
+		      WHERE metadata_id = '${INSTATES[$i]}';
+		      SELECT changes();
+    		      COMMIT;
+	 ")    
+    if [ $? -ne 0 ]; then #Error - unwind & exit
+	echo "Error: ${INSTATES[$i]}->${OUTSTATES[$i]}: Failed to update 'statistics_short_term' entries, unwinding..."
+	restore_backups
+	exit 9
+    fi
+    echo -e "${INSTATES[$i]}->${OUTSTATES[$i]}: $NUM\t$NUM_SHORT"
+done
+
+print_exit
