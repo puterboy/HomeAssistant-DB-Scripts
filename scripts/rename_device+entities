@@ -1,0 +1,355 @@
+#!/bin/bash
+#===============================================================================
+# DESCRIPTION:
+# Rename device and associated entities from OLD_DEVICE_NAME to NEW_DEVICE_NAME
+# and optionally:
+#    - Rename: name_by_user (for device -- see script 'rename_device' for details)
+#    - Rename: friendly_name (for entity -- see script 'rename_entity' for details)
+#    - Republish: MQTT discovery topic (and delete old one)
+#
+# Note: Calls the scripts 'rename_device' and 'rename_entity' that are assumed to be
+#       in the same directory as this script (unless otherwise configured)
+#
+# Note: also changes the names in the yaml files identified in the script 'rename_entity' unless
+#       the variable 'ADDYAML' is unset
+#
+# Note: There are a fair number of heuristics used here to make the MQTT publishing work and
+#       to seemlessly update various derived device and entity entries based on the old and
+#       new device names. I wrote the heuristics based on the common MQTT sensors I have but
+#       YMMV and the heuristics may not work for you. If so, either modify the code or make
+#       any missing changes manually.
+#
+#===============================================================================
+# USAGE:
+#    Usage: rename_device+entity [-n NEW_NAME_BY_USER] [-f NEW_FRIENDLY_NAME_STEM] [-m NEW_MQTT_TOPIC_STEM] [-b BACKUP_DIR] [-x HA_BASE] OLD_DEVICE_NAME NEW_DEVICE_NAME
+#        where:
+#          '-x' is the location of the base homeassistant directory (default: /homeassistant)
+#          '-y' also changes the entity name in yaml files
+#
+#    NOTE: NEW_DEVICE_NAME is used also to automatically update the unique_id by substituting it in place of the OLD_DEVICE_NAME where it occurs in the string
+#
+#===============================================================================
+# VERSION: 0.8.4
+#
+#===============================================================================
+# CHANGELOG
+#     0.7 (July 2024)
+#      - First official release
+#     0.8 (August 2024)
+#      - Added command-line parsing & cleaned up
+#     0.8.1 (August 2024)
+#      - Improved MQTT logic
+#     0.8.2 (December 2024)
+#      - Bug fixes
+#     0.8.3 (July 2024)
+#      - Bug fixes
+#     0.8.4 (July 2024)
+#      - Minor code tweak
+#
+#===============================================================================
+# AUTHOR:
+#    Jeff Kosowsky
+#    Copyright August 2024
+#
+#===============================================================================
+#### VARIABLES
+#===============================================================================
+#### Variables
+## MQTT Broker (optional - only used if MQTT_NEW_STEM is set)
+MQTT_HOST= #Host name or IP address for MQTT broker
+MQTT_USER="MQTT" #MQTT broker user name
+MQTT_PASSWD= #MQTT broker password
+MQTT_DATA_PREFIX="+/+/RTL_433toMQTT" #Base of where MQTT data is published (No trailing slash!)
+MQTT_DISCOVERY_PREFIX="homeassistant" #Base of where MQTT discovery topics are published (No trailing slash!)
+MOSQUITTO_TIMEOUT=3 #Timeout for mosquitto_sub in seconds
+
+#-------------------------------------------------------------------------------
+## General variables
+
+ADDYAML=1 #If set then also change the entity_id's as mentioned in the yaml config files specified in the script 'rename_entity'
+
+BASE=/homeassistant
+DB="home-assistant_v2.db"
+
+##Choose to undelete one of the following
+#BACKDIR="" #Set to blank if you don't want to backup data - not advisable
+#BACKDIR="/tmp/backups" #Temporary backup directory, deleted upon system reboot
+#BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *included* in standard HA backups
+BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *excluded* from standard HA backups
+
+if [ -n "$BACKDIR" ]; then
+    BACKDIR=${BACKDIR%%+(/)} #Remove all trailing slashes
+    mkdir -p "$BACKDIR" || exit 2
+fi
+
+DEVREGISTRY=core.device_registry
+ENTREGISTRY=core.entity_registry
+RESTORESTATE=core.restore_state
+
+SCRIPT_DIR="$(dirname $(readlink -f $0))"
+RENAME_DEVICE="$SCRIPT_DIR/rename_device"
+RENAME_ENTITY="$SCRIPT_DIR/rename_entity"
+
+MOSQUITTO_SUB="mosquitto_sub"
+MOSQUITTO_PUB="mosquitto_pub"
+
+original_nocasematch=$(shopt -p nocasematch)
+
+#===============================================================================
+#### Functions
+
+usage() {
+    PROG=${0##*/}
+    cat <<EOF >&2
+Usage: $PROG  [-n NEW_NAME_BY_USER] [-f NEW_FRIENDLY_NAME_STEM] [-m NEW_MQTT_TOPIC_STEM] [-b BACKUP_DIR] [-x HA_BASE] OLD_DEVICE_NAME NEW_DEVICE_NAME"
+EOF
+    exit 1
+}
+
+MQTT_key() { #Get full or abbreviated MQTT key based on how used in provided MQTT_STRING
+    MQTT_STRING="$1"
+    ABBREV_KEY="$2"
+    FULL_KEY="$3"
+    PREFIX="."    
+    [ -n "$4" ] && PREFIX="$PREFIX$4"
+
+    if echo "$MQTT_STRING" | jq -e ". | $PREFIX | has(\"$ABBREV_KEY\")" > /dev/null; then
+	echo "$ABBREV_KEY"
+    else
+	echo "$FULL_KEY"
+    fi
+}
+
+
+#===============================================================================
+#### PARSE OPTIONS
+
+while getopts b:f:hm:n:x: options; do
+    case "${options}" in
+	b) BACKDIR="${OPTARG}"
+	   ;;
+	f) FRIENDLY_NEW_STEM="${OPTARG}"
+	   ;;
+	m) MQTT_NEW_STEM="${OPTARG}"
+	   ;;
+	n) NAMEBYUSER_NEW="${OPTARG}"
+	   ;;
+	x) BASE="${OPTARG}"
+	   ;;
+	:) echo "Error: -${OPTARG} requires an argument." >&2
+	   usage
+	   ;;
+	h|*) usage
+	   ;;
+    esac
+done
+shift $((OPTIND - 1))
+BASE="${BASE%%/}"
+DB="$BASE/$DB"
+STORAGE="$BASE/.storage"
+
+if ! [ -f "$DB" ]; then
+    echo "Error: Can't find database file '$DB'"
+    exit 3
+fi
+if ! [ -d "$STORAGE" ]; then
+    echo "Error: Can't find storage directory '$STORAGE'"
+    exit 3
+fi
+
+if [ "$#" -ne 2 ]; then
+    usage
+fi
+
+DEVNAME_OLD="$1"
+DEVNAME_NEW="$2"
+
+#===============================================================================
+
+cd $STORAGE
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Must be root to run!"
+    exit 1
+fi
+
+if [ -z "$DEVNAME_OLD" ] || [ -z "$DEVNAME_NEW" ]; then
+    echo "ERROR: Missing device/entity-specific variables!"
+    exit 4
+fi
+
+#if [[ "$DEVNAME_OLD" == *\ * ]] || [[ "$DEVNAME_NEW" == *\ * ]]; then
+#    echo "ERROR: Device names should NOT have spaces!"
+#    exit 5
+#fi
+
+if [[ "$DEVNAME_NEW" == *\_* ]]; then
+    echo "WARNING: Device names should PREFERABLY use 'hyphens' and not 'underscores'"
+    echo -n "Do you want to proceed anyway? (y/n) " >&2
+    read -e ANSWER
+    echo
+    if [ "$ANSWER" != "y" ]; then
+	echo "Aborting..."
+	exit 6
+    fi
+fi
+
+{ read -r DEVID; read -r  NAMEBYUSER_OLD; } \
+    <<< $(cat $DEVREGISTRY | jq -M '.data.devices[], .data.deleted_devices[] | select(.name == "'"$DEVNAME_OLD"'") | .id, .name_by_user' | tr -d \" 2>/dev/null)
+
+if [ -z "$DEVID" ]; then
+    echo "ERROR: Can't find existing device '$DEVNAME_OLD'"
+    exit 7
+fi
+   
+ENTIDS_OLD=($(cat $ENTREGISTRY | jq -M '.data.entities[], .data.deleted_entities[] | select(.device_id == "'"$DEVID"'") | .entity_id' | tr -d \" 2>/dev/null))
+echo "${ENTIDS_OLD[@]}"; exit
+UNIQUEIDS_OLD=($(cat $ENTREGISTRY | jq -M '.data.entities[], .data.deleted_entities[] | select(.device_id == "'"$DEVID"'") | .unique_id' | tr -d \" 2>/dev/null))
+
+echo "DB: '$DB'"
+echo "BACKDIR: '${BACKDIR:-<No backup>}'"
+if [ -n "$MQTT_NEW_STEM" ]; then
+    echo "New MQTT topic stem: '$MQTT_NEW_STEM'"
+else
+    echo "New MQTT topic stem: [***NOT CHANGED***]"
+fi
+echo
+echo "Change device:"
+echo -e "    Device Name:  '$DEVNAME_OLD'\t->\t'$DEVNAME_NEW'"
+if [ -n "$NAMEBYUSER_NEW" ]; then
+    echo -e "    Name By User: '$NAMEBYUSER_OLD'\t->\t'$NAMEBYUSER_NEW'"
+else
+    echo "    Name By User: '$NAMEBYUSER_OLD' [***NOT CHANGED***]"
+fi
+echo -e "\nChange entities:"
+
+ENT_BASE="${DEVNAME_NEW,,}"
+ENT_BASE="sensor.${ENT_BASE//-/_}"
+echo $ENT_BASE
+
+if [ -n "$MQTT_NEW_STEM" ]; then
+    MQTT_NEW_STEM="${MQTT_DATA_PREFIX}/${MQTT_NEW_STEM}"
+    MQTT_NEW_STEM="${MQTT_NEW_STEM//\/\//\/}" #Remove extra slashes if any
+
+    MQTTPUB_OLD="$(timeout ${MOSQUITTO_TIMEOUT}s $MOSQUITTO_SUB -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASSWD" -t "$MQTT_DISCOVERY_PREFIX"/# -v |
+				     sed -e 's/^ *//g' | tr -d $'\n' | sed -e 's# *\([^{}]*/config \+{\)#\n\1#g')"
+    #Note the above is necessary in case the message is not one-line per discovery (on the same line as the discover topic)
+    #     but rather has multiple lines and extra white space
+fi
+    
+for((i=0; i < ${#ENTIDS_OLD[@]}; i++)); do
+    ENTIDS_OLD[i]="${ENTIDS_OLD[i]}"
+    SUFFIX=${ENTIDS_OLD[i]##*_}
+    ENTIDS_NEW[i]="${ENT_BASE}_$SUFFIX"
+
+    shopt -s nocasematch
+    UNIQUEIDS_NEW[i]="${UNIQUEIDS_OLD[i]/$DEVNAME_OLD/$DEVNAME_NEW}"
+    eval "$original_nocasematch"
+
+    echo -e "    Entity Id:     '${ENTIDS_OLD[i]}'\t->\t'${ENTIDS_NEW[i]}'"
+    echo -e "    Unique Id:     '${UNIQUEIDS_OLD[i]}'\t->\t'${UNIQUEIDS_NEW[i]}'"
+
+    FRIENDLYS_OLD[i]="$(cat $RESTORESTATE | jq -c -M '.data[] | select(.state.entity_id == "'"${ENTIDS_OLD[i]}"'") | .state.attributes.friendly_name' | tr -d \" 2>/dev/null)"
+    if [[ "${FRIENDLYS_OLD[i],,}" =~ "${SUFFIX,,}"$ ]]; then #Try to extract the correct capitalization of the friendly name suffix
+	SUFFIX_FRIENDLY="${FRIENDLYS_OLD[i]:${#FRIENDLYS_OLD[i]} - ${#BASH_REMATCH[0]}}"
+    else
+	SUFFIX_FRIENDLY="$SUFFIX"
+    fi
+    
+    if [ -n "$FRIENDLY_NEW_STEM" ]; then
+	FRIENDLYS_NEW[i]="${FRIENDLY_NEW_STEM} $SUFFIX_FRIENDLY"
+	echo -e "    Friendly Name: '${FRIENDLYS_OLD[i]}'\t->\t'${FRIENDLYS_NEW[i]}'"
+    else
+	echo "    Friendly Name: '${FRIENDLYS_OLD[i]}' [***NOT CHANGED***]"
+    fi
+
+    if [ -n "$MQTT_NEW_STEM" ]; then
+	{ read -r MQTT_TOPICS_OLD[i]; read -r  MQTT_MESGS_OLD[i]; } <<< $(echo "$MQTTPUB_OLD" | sed -n "s#^ *\([^{]*/${UNIQUEIDS_OLD[i]}\)/config *\(.*\)#\1\n\2#ip" | head -2)
+	shopt -s nocasematch
+	MQTT_TOPICS_NEW[i]="${MQTT_TOPICS_OLD[i]/${UNIQUEIDS_OLD[i]}/${UNIQUEIDS_NEW[i]}}"
+	eval "$original_nocasematch"
+	if [ -n "${MQTT_TOPICS_NEW[i]}" ]; then
+	    echo -e "    MQTT Topic:    '${MQTT_TOPICS_OLD[i]}'\t->\t'${MQTT_TOPICS_NEW[i]}'"
+	else
+	    echo "WARNING: Can't find MQTT Topic to change for this entity!"
+	fi
+    fi
+    echo
+done
+
+echo -n "Do you want to execute these changes? (y/n) " >&2
+read -e ANSWER
+echo
+if [ "$ANSWER" != "y" ]; then
+    echo "Aborting..."
+    exit 8
+fi
+
+## Rename Device
+echo "RENAMING DEVICE: $DEVNAME_OLD"
+"$RENAME_DEVICE" -b "$BACKDIR" -x "$BASE" ${NAMEBYUSER_NEW:+-n "$NAMEBYUSER_NEW"} "$DEVNAME_OLD" "$DEVNAME_NEW"
+if [ "$?" -ne 0 ]; then
+   echo "ERROR executing 'rename_device' for '$DEVNAME_OLD'... exiting"
+   exit 9
+fi	   
+
+echo
+
+###Rename entity id's and related entries
+for((i=0; i < ${#ENTIDS_OLD[@]}; i++)); do
+    echo "RENAMING ENTITY: ${ENTIDS_OLD[i]}"
+    "$RENAME_ENTITY" -b "$BACKDIR" -x "$BASE" -u "${UNIQUEIDS_NEW[i]}" ${FRIENDLY_NEW_STEM:+-f "${FRIENDLYS_NEW[i]}"} "${ENTIDS_OLD[i]}" "${ENTIDS_NEW[i]}"
+    if [ $? -ne 0 ]; then #Error
+	echo "ERROR executing 'rename_entity_id' for '${ENTIDDS_OLD[i]}'... exiting"
+	exit 10
+    fi
+
+    if [ -n "${MQTT_TOPICS_NEW[i]}" ]; then #Publish new MQTT_TOPIC and unpublish old one
+	#Check whether using short or long key names
+	STATE_TOPIC_KEY="$(MQTT_key "${MQTT_MESGS_OLD[i]}" "stat_t" "state_topic")"
+	DEVICE_KEY="$(MQTT_key "${MQTT_MESGS_OLD[i]}" "dev" "device")"	
+	UNIQUE_ID_KEY="$(MQTT_key "${MQTT_MESGS_OLD[i]}" "uniq_id" "unique_id")"	
+	IDENTIFIERS_KEY="$(MQTT_key "${MQTT_MESGS_OLD[i]}" "ids" "identifiers" "$DEVICE_KEY")"		
+	CONNECTIONS_KEY="$(MQTT_key "${MQTT_MESGS_OLD[i]}" "cns" "connections" "$DEVICE_KEY")"
+	JQ_STRING=$(cat <<EOF
+if .${STATE_TOPIC_KEY} != null then .${STATE_TOPIC_KEY} = "$MQTT_NEW_STEM" else . end |
+if .${UNIQUE_ID_KEY} != null then .${UNIQUE_ID_KEY} = "${UNIQUEIDS_NEW[i]}" else . end |
+if .${DEVICE_KEY}?.name != null then .${DEVICE_KEY}.name = "$DEVNAME_NEW" else . end |
+if .${DEVICE_KEY}?.${IDENTIFIERS_KEY} != null then
+    .${DEVICE_KEY}.${IDENTIFIERS_KEY} = (.${DEVICE_KEY}.${IDENTIFIERS_KEY} | map(if . == "$DEVNAME_OLD" then "$DEVNAME_NEW" else . end))
+else  . end |
+if .${DEVICE_KEY}?.${CONNECTIONS_KEY} != null then
+    .${DEVICE_KEY}.${CONNECTIONS_KEY} = (.${DEVICE_KEY}.${CONNECTIONS_KEY} | map(if .[1] == "$DEVNAME_OLD" then .[1] = "$DEVNAME_NEW" else . end))
+else . end
+EOF
+		 )
+
+	MQTT_MESG_NEW="$(echo "${MQTT_MESGS_OLD[i]}" | jq -M -c "$JQ_STRING")"
+#	echo "$MQTT_MESG_NEW" #DEBUG
+	
+	if [ "$(readlink -f "$BASE")" = "$(readlink -f "/homeassistant")" ]; then #Only publish MQTT changes if working on live database	
+	    $MOSQUITTO_PUB -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASSWD" -t "${MQTT_TOPICS_NEW[i]}/config" -m "$MQTT_MESG_NEW" -r #Publish new retained topic message
+	    if [ "$?" -ne 0 ]; then
+		echo "ERROR: Failed to publish new MQTT topic: ${MQTT_TOPICS_NEW[i]}: $MQTT_MESG_NEW"
+	    else #New topic published successfully
+		echo "   PUBLISHED new MQTT topic: ${MQTT_TOPICS_NEW[i]}: $MQTT_MESG_NEW"
+		$MOSQUITTO_PUB -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASSWD" -t "${MQTT_TOPICS_OLD[i]}/config" -m "" -r #Delete old topic
+		if [ "$?" -ne 0 ]; then
+		    echo "ERROR: Failed to delete old MQTT topic: ${MQTT_TOPICS_OLD[i]}"
+		else #Old topic deleted successfully
+		    echo "   DELETED old MQTT topic: ${MQTT_TOPICS_OLD[i]}"
+		fi
+	    fi
+	fi
+    fi
+
+    unset BACKDIR #No need to backup again for subsequent entities
+    echo 
+done
+
+if `which ha >/dev/null`; then
+   ha core status >&/dev/null
+   if [ $? -eq 1 ]; then #Stopped
+       echo "*** Don't forget to restart home assistant (ha core start) ***"
+   fi
+fi
