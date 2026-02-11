@@ -106,6 +106,7 @@ Rename entity_id name from OLD_ENTITY_ID to NEW_ENTITY_ID and optionally:
 - Updates or adds a new attribute for the NEW_FRIENDLY_NAME (if given) and assigns to relevant states
 
 #### Usage
+```
 rename_entity [-u NEW_UNIQUE_ID] [-O NEW_OBJECT_ID_BASE] [-o NEW_ORIGINAL_NAME] [-f NEW_FRIENDLY_NAME] [-y] [-b BACKUP_DIR] [-x HA_BASE] OLD_ENTITY_ID [NEW_ENTITY_ID]
   where:
     '-y' also changes in yaml files
@@ -128,13 +129,78 @@ To rename multiple entities with similar substitution, you can use a loop, e.g.,
 Note: `trace.saved_traces` contains entity_id's and friendly_names but no need to update it since historical
 automation debugging data only
 
-### HA DB tables affected
+#### HA DB tables affected
 ```
   states_meta [entity_id column]: (if changing 'entity_id`)
   statistics_meta [statistic_id column] (if changing: 'entity_id')
   state_attributes (if changing: 'friendly_name')
   states (if changing: 'friendly_name')
+```
 
 Note: 'events_data' is not changed as it represents historical database changes
 
+## rename_device+entities
 
+#### Description
+Rename device and associated entities from OLD_DEVICE_NAME to NEW_DEVICE_NAME and optionally:
+  - Rename: name_by_user (for device -- see script 'rename_device' for details)
+  - Rename: friendly_name (for entity -- see script 'rename_entity' for details)
+  - Republish: MQTT discovery topic (and delete old one)
+
+Note: Calls the scripts `rename_device` and `rename_entity` that are assumed to be
+in the same directory as this script (unless otherwise configured)
+
+Note: also changes the names in the yaml files identified in the script `rename_entity` unless the variable
+'ADDYAML' is unset
+
+Note: There are a fair number of heuristics used here to make the MQTT publishing work and to seemlessly update various derived device and entity entries based on the old and new device names. I wrote the heuristics based on
+the common MQTT sensors I have but YMMV and the heuristics may not work for you. If so, either modify the code or make any missing changes manually.
+
+#### Usage
+```
+rename_device+entity [-n NEW_NAME_BY_USER] [-f NEW_FRIENDLY_NAME_STEM] [-m NEW_MQTT_TOPIC_STEM] [-b BACKUP_DIR] [-x HA_BASE] OLD_DEVICE_NAME NEW_DEVICE_NAME
+  where:
+    '-x' is the location of the base homeassistant directory (default: /homeassistant)
+    '-y' also changes the entity name in yaml files
+
+  NOTE: NEW_DEVICE_NAME` is used also to automatically update the unique_id by substituting it in place of the OLD_DEVICE_NAME where it occurs in the string
+```
+
+#### Files affected
+See `rename_device` and `rename_entity`
+
+#### HA DB tables affected
+See `rename_entity`
+
+## move_states
+
+#### Description
+Move state metadata_ids from: (X1, X2,..., Xn) --> (Y1, Y2,..., Yn)
+
+#### Usage
+```
+move_states -i X1 X2... Xn -o Y1 Y2... Yn
+```
+
+#### HA DB tables affected
+```
+states_meta [metadata_id column]
+states [metadata_id column]
+```
+
+## move_statistics
+
+#### Description
+Move statistic metadata_id's from: (X1, X2,..., Xn) --> (Y1, Y2,..., Yn)
+
+#### Usage
+```
+Usage: move_statistics -i X1 X2... Xn -o Y1 Y2... Yn
+```
+
+#### HA DB tables affected
+```
+statistics_meta [id column]
+statistics [metadata_id column]
+statistics_short_term [metadata_id column]
+```
