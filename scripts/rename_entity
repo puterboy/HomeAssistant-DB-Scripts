@@ -1,0 +1,462 @@
+#!/bin/bash
+#===============================================================================
+# DESCRIPTION:
+#    Rename one or more of the following:
+#    - Rename entity_id name from OLD_ENTITY_ID to NEW_ENTITY_ID
+#        (in core.entity_registry, core.restore_state, homeassistant_exposed_entities, lovelace.dashboard_*, yaml files, home-assistant_v2.db)
+#    - Rename the corresponding 'unique_id' to NEW_UNIQUE_ID (in core.entity_registry)
+#    - Rename the corresponding 'object_id' to NEW_OBJECT_ID_BASE (in core.entity_registry)
+#    - Rename the corresponding 'original_name' to NEW_ORIGINAL_NAME (in core.entity_registry)
+#    - Rename the corresponding 'friendly_name' to NEW_FRIENDLY_NAME (in core.restore_state and if present in HA db)
+#
+#    - Rename designated entity_id names mentioned anywhere in configurations, automations, scripts [USE carefully]
+#        See variables: YAML_FILES_BASIC and YAML_FILES_ADDED
+#    - Rename 'unique_id' in same yaml files when mentioned in format: "unique_id":\s+"UNIQUE_ID"
+#    
+#    - Updates or adds a new attribute for the NEW_FRIENDLY_NAME (if given) and assigns to relevant states)
+#
+# Note: Makes changes to the following registries (where applicable based on options)
+#          core.entity_registry (if changing: 'entity_id', 'unique_id', 'original_name')
+#          core.restore_state (if changing: 'entity_id', 'friendly_name')
+#          homeassistant.exposed_entities (if changing 'entity_id')
+#          lovelace.dashboard_* (if changing: 'entity_id')
+#          *.yaml (if changing 'entity_id')
+#
+#
+#       Note: `trace.saved_traces` contains entity_id's and friendly_names but no need to update it since historical automation debugging data only
+#
+# Note: Changes the following tables in home-assistant_v2.db:
+#          states_meta [entity_id column] (if changing: 'entity_id')
+#          statistics_meta [statistic_id column] (if changing: 'entity_id')
+#          state_attributes (if changing: 'friendly_name')
+#          states  (if changing: 'friendly_name')
+#
+#       Note: 'events_data' is not changed as it represents historical database changes
+#
+# To rename multiple entities with similar substitution, use loop, e.g.,
+#     (OLD="<old_substring>"; NEW="<new_subtring>"; for entity in $(sudo sqlite3 $DB "SELECT entity_id FROM states_meta" | grep "$OLD"); do sudo rename_entity   $entity  ${entity/$OLD/$NEW}; done)
+#
+# TODO: Change unique_id structurally in yaml files
+#
+#===============================================================================
+# USAGE:
+#    Usage: rename_entity [-u NEW_UNIQUE_ID] [-O NEW_OBJECT_ID_BASE] [-o NEW_ORIGINAL_NAME] [-f NEW_FRIENDLY_NAME] [-y] [-b BACKUP_DIR] [-x HA_BASE] OLD_ENTITY_ID [NEW_ENTITY_ID]
+#        where:
+#          '-y' also changes in yaml files
+#          '-x' is the location of the base homeassistant directory (default: /homeassistant)
+#
+#===============================================================================
+# VERSION: 0.9
+#
+#===============================================================================
+# CHANGELOG
+#     0.5 (June 2024)
+#      - First official release
+#     0.6 (July 2024)
+#      - Added ability to set backup directory
+#     0.7 (July 2024)
+#      - Improved backup/restore
+#      - Added renaming of dashboard entities
+#     0.8 (August 2024)
+#      - Minor cleanup
+#     0.8.1 (August 2024)
+#      - Added trap to remove tmpfile
+#      - Added option to change original_name
+#     0.8.2 (December 2024)
+#      - Bug fixes
+#     0.8.3 (July 2024)
+#      - Bug fixes
+#     0.8.4 (July 2024)
+#      - Minor code tweak
+#     0.9 (February 2026)
+#      - Added: object_id_base
+#      - Minor code fixes & improvements
+#
+#===============================================================================
+# AUTHOR:
+#    Jeff Kosowsky
+#    Copyright February 2026
+#
+#===============================================================================
+#### VARIABLES
+
+BASE=/homeassistant
+DB="home-assistant_v2.db"
+
+#NOTE paths for below are relative to $BASEs
+YAML_FILES_BASIC=("automations.yaml" "configuration.yaml" "scenes.yaml" "scripts.yaml")
+#YAML_FILES_ADDED=("") #Add additional YAML files here that contain entity name
+YAML_FILES=("${YAML_FILES_BASIC[@]}" "${YAML_FILES_ADDED[@]}")
+
+##Choose to undelete one of the following
+#BACKDIR="" #Set to blank if you don't want to backup data - not advisable
+#BACKDIR="/tmp/backups" #Temporary backup directory, deleted upon system reboot
+#BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *included* in standard HA backups
+BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *excluded* from standard HA backups
+
+if [ -n "$BACKDIR" ]; then
+    BACKDIR=${BACKDIR%%+(/)} #Remove all trailing slashes
+    mkdir -p "$BACKDIR" || exit 2
+fi
+
+TMPFILE=$(mktemp /tmp/HAtempbak.XXXXXXX)
+trap 'rm -f $TMPFILE' EXIT INT TERM QUIT
+
+ENTREGISTRY=core.entity_registry
+RESTORESTATE=core.restore_state
+EXPOSEDENTITIES=homeassistant.exposed_entities
+
+#===============================================================================
+#### FUNCTIONS
+
+usage() {
+    PROG=${0##*/}
+    cat <<EOF >&2
+Usage: $PROG [-u NEW_UNIQUE_ID] [-O NEW_OBJECT_ID_BASE] [-o NEW_ORIGINAL_NAME] [-f NEW_FRIENDLY_NAME] [-b BACKUP_DIR] [-x HA_BASE] OLD_ENTITY_ID [NEW_ENTITY_ID]
+EOF
+    exit 1
+    }
+
+print_exit() {
+    [ -n "$RESTART_HA" ] && echo "*** Don't forget to restart home assistant (ha core start)"
+    exit 0
+}
+
+DATE="$(date +%Y%m%d-%H%M%S)"
+declare -A BACKUPS
+backup() {
+    [ -z "$BACKDIR" ] && return #Don't backup
+    SRC="$1"
+    IGNORE_EXIST="$2"
+    BACK="${BACKDIR}/${SRC##*/}-$DATE"
+    if ! [ -e "$SRC" ]; then
+       echo "ERROR: Can't back up '$SRC' to '$BACK' since '$SRC' DOESN'T exist"
+    elif [ -z $IGNORE_EXIST ] && [ -e "$BACK" ]; then
+	echo "ERROR: Can't back up '$SRC' to '$BACK' since '$BACK' ALREADY exists"
+    else
+	cp -a "$SRC" "$BACK"
+	echo "...'$SRC' backed up to '$BACK"
+	BACKUPS["$SRC"]="$BACK"
+    fi
+}
+
+restore_backups() {
+    for SRC in ${!BACKUPS[@]}; do
+	BACK="${BACKUPS[$SRC]}"
+	if [ -e "$BACK" ]; then
+	    mv -f "$BACK" "$SRC"
+	    echo "...'$BACK' restored to '$SRC'"
+	else
+	    echo "ERROR: Can't restore '$BACK' to '$SRC' since '$BACK' DOESN'T exist"
+	fi
+    done
+    rm -f $TMPFILE
+}
+
+fnv1a_32() { #Fowler–Noll–Vo hash function
+    local data="$1"
+    local hash_value=0x811C9DC5  # FNV-1a 32-bit initial hash value
+    local fnv_prime=0x01000193   # FNV-1a 32-bit prime
+
+    # Convert the input string to hex bytes
+    local hex_data=$(echo -n "$data" | xxd -p | tr -d '\n')
+
+    # Process each byte
+    for (( i=0; i<${#hex_data}; i+=2 )); do
+        local byte="0x${hex_data:$i:2}"
+        hash_value=$(( (hash_value ^ byte) * fnv_prime )) # XOR the current hash value with the byte
+        hash_value=$(( hash_value & 0xFFFFFFFF )) # Ensure 32-bit overflow
+    done
+
+    # Print the hash_value as an unsigned 32-bit integer
+    echo $hash_value
+}
+
+#===============================================================================
+#### PARSE OPTIONS
+
+while getopts b:f:o:O:hu:x:y options; do
+    case "${options}" in
+	b) BACKDIR="${OPTARG}"
+	   ;;
+	f) NEWFRIENDLY="${OPTARG}"
+	   ;;
+	o) NEWORIGNAME="${OPTARG}"
+	   ;;
+	O) NEWOBJECTIDBASE="${OPTARG}"
+	   ;;
+	u) NEWUNIQUEID="${OPTARG}"
+	   ;;
+	x) BASE="${OPTARG}"
+	   ;;
+	y) ADDYAML=1
+	   ;;
+	:) echo "Error: -${OPTARG} requires an argument." >&2
+	   usage
+	   ;;
+	h|*) usage
+	   ;;
+    esac
+done
+BASE="${BASE%%/}"
+DB="$BASE/$DB"
+STORAGE="$BASE/.storage"
+
+if ! [ -f "$DB" ]; then
+    echo "Error: Can't find database file '$DB'"
+    exit 3
+fi
+if ! [ -d "$STORAGE" ]; then
+    echo "Error: Can't find storage directory '$STORAGE'"
+    exit 3
+fi
+
+shift $((OPTIND - 1))
+
+OLDENTID="$1"
+NEWENTID="$2"
+
+if ([ "$#" -lt 1 ] || [ "$#" -gt 2 ]) || \
+       ([ -z "$NEWENTID" ] && [ -z "$NEWFRIENDLY" ] && [ -z "$NEWORIGNAME" ] && [ -z "$NEWOBJECTIDBASE" ] && [ -z "$NEWUNIQUEID" ]); then
+    usage
+fi
+
+if ! [[ "$OLDENTID" =~ ^[a-z0-9._]+$ ]] || ! [[ "$NEWENTID" =~ ^[a-z0-9._]*$ ]]; then
+    echo "Error: entity_ids must contain only lowercase letters, numbers, periods, and underscores!"
+    exit 1
+fi
+
+#===============================================================================
+#### Sanity Checks
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Must be root to run!"
+    exit 2
+fi
+
+if ! [ -e "$DB" ]; then
+    echo "Error: Can't find database '$DB'..." >&2
+    exit 4
+fi
+
+#Stop Home Assistant before querying & changing databases if HA running and operating on live database
+if `which ha >/dev/null` && [ "$(readlink -f "$DB")" = "$(readlink -f "/homeassistant/home-assistant_v2.db")" ]; then
+   ha core status >&/dev/null
+   if [ $? -ne 1 ]; then #Not stopped so presumably running
+       echo "Stopping home assistant..."
+       ha core stop >&/dev/null
+       if [ $? -ne 0 ]; then
+	   echo "Error: Couldn't stop home assistant..."
+	   exit 5
+       fi
+       RESTART_HA=1
+   fi
+fi
+
+cd $STORAGE
+
+if [ -z "$(cat $ENTREGISTRY | jq -c -M '.data.entities[], .data.deleted_entities[] | select(.entity_id == "'"$OLDENTID"'")')" ]; then
+    echo "Error: Can't find '$OLDENTID' in '$ENTREGISTRY'" >&2
+    exit 6
+fi
+
+if [ -n "$NEWENTID" ] && [ -n "$(cat $ENTREGISTRY | jq -c -M '.data.entities[], .data.deleted_entities[] | select(.entity_id == "'"$NEWENTID"'")')" ]; then
+    echo "Error: '$NEWENTID' already exists in '$ENTREGISTRY'" >&2
+    exit 7
+fi
+
+#===============================================================================
+#### Update entries in '.storage' registries
+
+### Update 'entity_id' and/or 'unique_id' and/or 'original_name in $ENTREGISTRY (core.entity_registry)
+if [ -n "$NEWENTID" ] || [ -n "$NEWUNIQUEID" ] || [ -n "$NEWOBJECTIDBASE" ] || [ -n "$NEWORIGNAME" ]; then
+    backup $ENTREGISTRY
+
+    ACTION=""
+    MESG=""
+    if [ -n "$NEWENTID" ]; then #Add action to change .entity_id
+	[ -n "$ACTION" ] && ACTION="$ACTION |"
+	ACTION="$ACTION .entity_id = \"$NEWENTID\""
+	MESG="$MESG 'entity_id'"
+    fi
+
+    if [ -n "$NEWUNIQUEID" ]; then #Add action to change .unique_id
+	[ -n "$ACTION" ] && ACTION="$ACTION |"	
+	ACTION="$ACTION .unique_id = \"$NEWUNIQUEID\""
+	MESG="$MESG '.unique_id'"
+    fi
+
+    if [ -n "$NEWOBJECTIDBASE" ]; then #Add action to change .object_id_base
+	[ -n "$ACTION" ] && ACTION="$ACTION |"	
+	ACTION="$ACTION .object_id_base = \"$NEWOBJECTIDBASE\""
+	MESG="$MESG '.object_id_base'"
+    fi
+
+    if [ -n "$NEWORIGNAME" ]; then #Add action to change .original_name
+	[ -n "$ACTION" ] && ACTION="$ACTION |"		
+	ACTION="$ACTION .original_name = \"$NEWORIGNAME\""
+	MESG="$MESG '.original_name'"
+    fi
+
+    JQ_STRING="(.data.entities, .data.deleted_entities) |= map(if .entity_id == \"$OLDENTID\" then $ACTION else . end)"
+    cp -f $ENTREGISTRY $TMPFILE
+    cat $TMPFILE | jq -M "$JQ_STRING" >| $ENTREGISTRY
+    if [ $? -ne 0 ]; then #Error - unwind & exit
+	echo "Error: Failed to change 'entity_id in '$ENTREGISTRY', unwinding..."
+	restore_backups
+	exit 8
+    fi
+    echo "   CHANGED: $MESG in '$ENTREGISTRY'."
+fi
+
+### Update 'entity_id' and/or 'friendly_name' in $RESTORESTATE (core.restore_state)
+if ([ -n "$NEWENTID" ] || [ -n "$NEWFRIENDLY" ]) && \
+       [ -n "$(cat $RESTORESTATE | jq -c -M '.data[] | select(.state.entity_id == "'"$OLDENTID"'")')" ]; then #Entry exists in 'core.restore_state'
+    backup $RESTORESTATE
+
+    ACTION=""
+    MESG=""
+    if [ -n "$NEWENTID" ]; then #Add action to change .entity_id
+	[ -n "$ACTION" ] && ACTION="$ACTION |"
+	ACTION="$ACTION .state.entity_id = \"$NEWENTID\""
+	MESG="$MESG 'entity_id'"
+    fi
+
+    if [ -n "$NEWFRIENDLY" ]; then #Add action to change .friendly_name
+	[ -n "$ACTION" ] && ACTION="$ACTION |"
+	ACTION="$ACTION .state.attributes.friendly_name = \"$NEWFRIENDLY\""
+	MESG="$MESG '.friendly_name'"
+    fi
+
+    JQ_STRING=".data |= map(if .state.entity_id == \"$OLDENTID\" then $ACTION else . end)"
+
+    cp -f $RESTORESTATE $TMPFILE
+    cat $TMPFILE | jq -M "$JQ_STRING" >| $RESTORESTATE
+    if [ $? -ne 0 ]; then #Error - unwind & exit
+	echo "Error: Failed to change $MESG in '$RESTORESTATE', unwinding..."
+	restore_backups
+	exit 9
+    fi
+    echo "   CHANGED: $MESG in '$RESTORESTATE'."
+fi
+
+### Update 'entity_id' in $EXPOSEDENTITIES(homeassistant.exposed_entities)
+if [ -n "$NEWENTID" ] && \
+       [ "$(cat $EXPOSEDENTITIES | jq -c -M '.data.exposed_entities."'"$OLDENTID"'"')" != "null" ]; then #Entry exist in 'home-assistant.exposed_entities'       
+    backup $EXPOSEDENTITIES
+    cp -f $EXPOSEDENTITIES $TMPFILE
+    cat $TMPFILE | jq -M '.data.exposed_entities |= with_entries(if .key == "'"$OLDENTID"'" then {key:"'"$NEWENTID"'", value: .value}  else . end)' >| ${EXPOSEDENTITIES}
+    if [ $? -ne 0 ]; then #Error - unwind & exit
+	echo "Error: Failed to change 'entity_id' in '$EXPOSEDENTITIES', unwinding..."
+	restore_backups
+	exit 10
+    fi
+    echo "   CHANGED: 'entity_id' in '$EXPOSEDENTITIES'."
+fi
+
+## Update 'entity_id' in lovelace dashboards
+if [ -n "$NEWENTID" ]; then
+    dashboards=($(ls lovelace.dashboard_*))
+    for DASHBOARD in ${dashboards[*]}; do
+	if(cat $DASHBOARD | grep -q "\"entity\":\s*\"$OLDENTID\""); then
+	    backup $DASHBOARD
+	    sed -i -e "s/\(\"entity\":\s*\)\"$OLDENTID\"/\1\"$NEWENTID\"/g" $DASHBOARD
+	    echo "   CHANGED: 'entity_id' in '$DASHBOARD'"	
+	fi
+    done
+fi
+
+## Update 'entity_id' in yaml files
+if [ -n "$NEWENTID" ] && [ -n "$ADDYAML" ]; then
+    for YAML in ${YAML_FILES[*]}; do
+	[[ ${YAML:0:1} == "/" ]] || YAML="$BASE/$YAML"
+	if [ -e "$YAML" ] && $(cat $YAML | grep -q "\b$OLDENTID\b"); then
+	    backup $YAML
+	    sed -i -e "s/\<$OLDENTID\>/$NEWENTID/g" $YAML
+	    echo "   CHANGED: 'entity_id' in '$YAML'"		
+	fi
+    done
+fi
+
+#===============================================================================
+#### Update 'home-assistant_v2.db'
+if [ -n "$NEWENTID" ]; then
+#Update 'states_meta' to change OLDENTID -> NEWENTID
+    if [ -n "$(sqlite3 "$DB" "SELECT 1 FROM states_meta WHERE entity_id = '$OLDENTID'")" ] && \
+	   [ -z "$(sqlite3 "$DB" "SELECT 1 FROM states_meta WHERE entity_id = '$NEWENTID'")" ]; then #OLDENTID exists in states_meta but not NEWENTID
+	backup "$DB" 1
+	NUM="$(sqlite3 "$DB" "UPDATE states_meta SET entity_id = '$NEWENTID' WHERE entity_id = '$OLDENTID'; SELECT CHANGES()")"
+	if [ "$NUM" -eq 1 ]; then
+	    echo "   CHANGED 'entity_id' in 'states_meta' table in $DB"
+	else
+	    echo "   Error: failed to change 'entity_id' in 'states_meta' table in $DB, unwinding..."
+	    restore_backups
+	fi
+    else
+	echo "   WARNING: 'OLDENTID' not present in 'states_meta' table in $DB, so *NOT* changed"
+    fi
+
+#Update 'statistics_meta' to change OLDENTID -> NEWENTID
+    if [ -n "$(sqlite3 "$DB" "SELECT 1 FROM statistics_meta WHERE statistic_id = '$OLDENTID'")" ] && \
+	   [ -z "$(sqlite3 "$DB" "SELECT 1 FROM statistics_meta WHERE statistic_id = '$NEWENTID'")" ]; then #OLDENTID exists in statistics_meta but not NEWENTID
+	backup "$DB" 1
+	NUM="$(sqlite3 "$DB" "UPDATE statistics_meta SET statistic_id = '$NEWENTID' WHERE statistic_id = '$OLDENTID'; SELECT CHANGES()")"
+	if [ "$NUM" -eq 1 ]; then
+	    echo "   CHANGED 'statistic_id' in 'statistics_meta' table in $DB"
+	else
+	    echo "   Error: failed to change 'statistic_id' in 'statistics_meta' table in $DB, unwinding..."
+	    restore_backups	
+	fi
+    else
+	echo "   WARNING: 'OLDENTID' not present in 'statistics_meta' table in $DB, so *NOT* changed"
+    fi
+fi
+
+[ -z "$NEWENTID" ] && NEWENTID="$OLDENTID" # Now all states_meta and statistics_meta have been changed to $NEWENTITYID if set
+#In 'state_attributes' table, change "friendly_name" of entity to new name (or add new attribute if not possible to change)
+if [ -n "$NEWFRIENDLY" ]; then
+    RESULT=$(sqlite3 "$DB" "SELECT s.attributes_id, sa.shared_attrs FROM states s LEFT JOIN states_meta sm ON (s.metadata_id=sm.metadata_id) LEFT JOIN state_attributes sa ON (s.attributes_id=sa.attributes_id) WHERE sm.entity_id = '$NEWENTID' ORDER BY s.state_id DESC LIMIT 1")
+
+    if [ ${#RESULT} -ne 0 ]; then #Last attribute exists
+	IFS='|' read -r ATTRIBUTES_ID SHARED_ATTRS <<< "$RESULT"
+
+	SHARED_ATTRS_NEW=$(echo "$SHARED_ATTRS" | jq -c ".friendly_name = \"$NEWFRIENDLY\"")
+	HASH_NEW="$(fnv1a_32 "$SHARED_ATTRS_NEW")"
+	ATTRIBUTES_ID_NEW="$(sqlite3 "$DB" "SELECT attributes_id FROM state_attributes WHERE hash = '$HASH_NEW' ORDER BY attributes_id DESC LIMIT 1")"
+	if [ ${#ATTRIBUTES_ID_NEW} -ne 0 ]; then #New hash already exists in 'attributes' table so just update states in 'states' table with old attribute pointing to new attribute
+	    NUM=$(sqlite3 "$DB" "UPDATE states SET attributes_id = '$ATTRIBUTES_ID_NEW' WHERE attributes_id = '$ATTRIBUTES_ID'; SELECT CHANGES()")
+	    if [ $? -ne 0 ]; then #Error - unwind & exit
+		echo "Error: Failed to update states to point to existing attribute with new  'friendly_name', unwinding..."
+		restore_backups
+		exit 11
+	    fi	
+	    echo "   UPDATED '$NUM' states to point to *pre-existing* 'attributes_id'=$ATTRIBUTES_ID_NEW with new 'friendly_name'"
+	elif [ "$(sqlite3 "$DB" "SELECT COUNT(DISTINCT metadata_id) FROM states WHERE attributes_id = '$ATTRIBUTES_ID'")" -eq 1 ]; then #Only associated with our entity, so can just update existing attribute
+	    sqlite3 "$DB" "UPDATE state_attributes SET hash = '$HASH_NEW', shared_attrs = '$SHARED_ATTRS_NEW' WHERE attributes_id = '$ATTRIBUTES_ID'"
+	    if [ $? -ne 0 ]; then #Error - unwind & exit
+		echo "Error: Failed to update 'friendly_name' in 'state_attributes' table, unwinding..."
+		restore_backups
+		exit 12
+	    fi
+	    echo "   CHANGED 'friendly_name' for existing 'attributes_id'=$ATTRIBUTES_ID in 'state_attributes' table"
+	else #Existing attribute associated with multiple entities, so create new one and update states with old attributes_id to point to the new one
+	    ATTRIBUTES_ID_NEW="$(sqlite3 "$DB" "INSERT INTO state_attributes (hash, shared_attrs) VALUES ('$HASH_NEW', '$SHARED_ATTRS_NEW'); SELECT last_insert_rowid()")" #Create new attribute with $NEWFRIENDLY name
+	    if [ $? -ne 0 ]; then #Error - unwind & exit
+		echo "Error: Failed to create new attribute with 'friendly_name' equal to '$NEWFRIENDLY', unwinding..."
+		restore_backups
+		exit 13
+	    fi
+	    echo "NEWID=$ATTRIBUTES_ID_NEW"
+	    NUM=$(sqlite3 "$DB" "UPDATE states SET attributes_id = '$ATTRIBUTES_ID_NEW' WHERE attributes_id = '$ATTRIBUTES_ID'; SELECT CHANGES()")
+	    if [ $? -ne 0 ]; then #Error - unwind & exit
+		echo "Error: Failed to update states to point to existing attribute with new  'friendly_name', unwinding..."
+		restore_backups
+		exit 14
+	    fi
+	    echo "   UPDATED '$NUM' states to point to *new* 'attributes_id'=$ATTRIBUTES_ID_NEW with new 'friendly_name'"	
+	fi
+	
+    fi
+fi
+
+print_exit
