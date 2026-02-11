@@ -1,0 +1,217 @@
+#!/bin/bash
+#===============================================================================
+# DESCRIPTION:
+# Rename device from OLD_DEVICE_NAME to NEW_DEVICE_NAME and optionally:
+#    - Rename 'name_by_user' to NEW_NAME_BY_USER
+#
+# Note: Makes changes to 'core.device_registry'
+#
+#===============================================================================
+# USAGE:
+#    Usage: rename_device [-n NEW_NAME_BY_USER] [-b BACKUP_DIR] [-x HA_BASE] OLD_DEVICE_NAME NEW_DEVICE_NAME
+#        where:
+#          '-x' is the location of the base homeassistant directory (default: /homeassistant)
+#
+#===============================================================================
+# VERSION: 0.8.4
+#
+#===============================================================================
+# CHANGELOG
+#     0.7 (July 2024)
+#      - First official release
+#     0.8 (August 2024)
+#      - Minor cleanup
+#     0.8.1 (August 2024)
+#      - Added trap to remove tmpfile
+#     0.8.2 (December 2024)
+#      - Bug fixes
+#     0.8.3 (July 2024)
+#      - Bug fixes
+#     0.8.4 (July 2024)
+#      - Minor code tweak
+#
+#===============================================================================
+# AUTHOR:
+#    Jeff Kosowsky
+#    Copyright August 2024
+#
+#===============================================================================
+#### VARIABLES
+
+BASE=/homeassistant
+DB="home-assistant_v2.db"
+
+##Choose to undelete one of the following
+#BACKDIR="" #Set to blank if you don't want to backup data - not advisable
+#BACKDIR="/tmp/backups" #Temporary backup directory, deleted upon system reboot
+#BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *included* in standard HA backups
+BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *excluded* from standard HA backups
+
+if [ -n "$BACKDIR" ]; then
+    BACKDIR=${BACKDIR%%+(/)} #Remove all trailing slashes
+    mkdir -p "$BACKDIR" || exit 2
+fi
+
+TMPFILE=$(mktemp /tmp/HAtempbak.XXXXXXX)
+trap 'rm -f $TMPFILE' EXIT INT TERM QUIT
+
+DEVREGISTRY=core.device_registry
+
+#===============================================================================
+#### FUNCTIONS
+
+usage() {
+    PROG=${0##*/}
+    cat <<EOF >&2
+Usage: $PROG [-n NEW_NAME_BY_USER] [-b BACKUP_DIR] [-x HA_BASE] OLD_DEVICE_NAME NEW_DEVICE_NAME
+EOF
+    exit 1
+    }
+
+print_exit() {
+    [ -n "$RESTART_HA" ] && echo "*** Don't forget to restart home assistant (ha core start)"
+    exit 0
+}
+
+DATE="$(date +%Y%m%d-%H%M%S)"
+declare -A BACKUPS
+backup() {
+    [ -z "$BACKDIR" ] && return #Don't backup
+    SRC="$1"
+    IGNORE_EXIST="$2"
+    BACK="${BACKDIR}/${SRC##*/}-$DATE"
+    if ! [ -e "$SRC" ]; then
+       echo "ERROR: Can't back up '$SRC' to '$BACK' since '$SRC' DOESN'T exist"
+    elif [ -z $IGNORE_EXIST ] && [ -e "$BACK" ]; then
+	echo "ERROR: Can't back up '$SRC' to '$BACK' since '$BACK' ALREADY exists"
+    else
+	cp -a "$SRC" "$BACK"
+	echo "...'$SRC' backed up to '$BACK"
+	BACKUPS["$SRC"]="$BACK"
+    fi
+}
+
+restore_backups() {
+    for SRC in ${!BACKUPS[@]}; do
+	BACK="${BACKUPS[$SRC]}"
+	if [ -e "$BACK" ]; then
+	    mv -f "$BACK" "$SRC"
+	    echo "...'$BACK' restored to '$SRC'"
+	else
+	    echo "ERROR: Can't restore '$BACK' to '$SRC' since '$BACK' DOESN'T exist"
+	fi
+    done
+    rm -f $TMPFILE
+}
+
+#===============================================================================
+#### PARSE OPTIONS
+
+while getopts b:hn:x: options; do
+    case "${options}" in
+	b) BACKDIR="${OPTARG}"
+	   ;;
+	n) NEWUSERNAME=${OPTARG}
+	   ;;
+	x) BASE="${OPTARG}"
+	   ;;	
+	:) echo "Error: -${OPTARG} requires an argument." >&2
+	   usage
+	   ;;
+	h|*) usage
+	   ;;
+    esac
+done
+shift $((OPTIND - 1))
+BASE="${BASE%%/}"
+DB="$BASE/$DB"
+STORAGE="$BASE/.storage"
+
+if ! [ -f "$DB" ]; then
+    echo "Error: Can't find database file '$DB'"
+    exit 3
+fi
+if ! [ -d "$STORAGE" ]; then
+    echo "Error: Can't find storage directory '$STORAGE'"
+    exit 3
+fi
+
+if [ "$#" -ne 2 ]; then
+    echo "Error wrong number of arguments..."
+    usage
+fi
+
+OLDDEVNAME="$1"
+NEWDEVNAME="$2"
+
+#===============================================================================
+#### Sanity Checks
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Must be root to run!"
+    exit 1
+fi
+
+#Stop Home Assistant before querying & changing databases if HA running and operating on live database
+if `which ha >/dev/null` && [ "$(readlink -f "$DB")" = "$(readlink -f "/homeassistant/home-assistant_v2.db")" ]; then
+   ha core status >&/dev/null
+   if [ $? -ne 1 ]; then #Not stopped so presumably running
+       echo "Stopping home assistant..."
+       ha core stop >&/dev/null
+       if [ $? -ne 0 ]; then
+	   echo "Error: Couldn't stop home assistant..."
+	   exit 4
+       fi
+       RESTART_HA=1
+   fi
+fi
+
+cd $STORAGE
+if [ -z "$(cat $DEVREGISTRY | jq -c -M '.data.devices[], .data.deleted_devices[] | select(.name == "'"$OLDDEVNAME"'")')" ]; then
+    echo "Error: Can't find '$OLDDEVNAME' in '$DEVREGISTRY'" >&2
+    exit 5
+fi
+
+#===============================================================================
+### Update 'name' and if relevant 'connections' (e.g., 'mac' name) and 'identifiers' (e.g., 'mqtt' name) (and optionally 'name_by_user') in $DEVREGISTRY (core.device_registry)
+backup $DEVREGISTRY
+
+MESG="'entity_id'"
+CHANGE_USERNAME=""
+if [ -n "$NEWUSERNAME" ]; then #Add action to change .name_by_user
+    CHANGE_USERNAME="| .name_by_user = \"$NEWUSERNAME\""
+    MESG="$MESG and '.name_by_user'"
+fi
+
+JQ_STRING=$(cat <<EOF #Change .name (and optionally .name_by_user) then change if present in "identifiers" or "connections"
+ (.data.devices, .data.deleted_devices) |= map(
+    if .name == "$OLDDEVNAME" then
+      .name = "$NEWDEVNAME" $CHANGE_USERNAME
+      | .identifiers |= map(
+        if .[1] == "$OLDDEVNAME" then
+          .[1] = "$NEWDEVNAME"
+        else
+          .
+        end
+      )
+      | .connections |= map(
+        if .[1] == "$OLDDEVNAME" then
+          .[1] = "$NEWDEVNAME"
+        else
+          .
+        end
+      )   
+    else . end)
+EOF
+	 )
+
+cp -f $DEVREGISTRY $TMPFILE
+cat $TMPFILE | jq -M "$JQ_STRING" >| $DEVREGISTRY
+if [ $? -ne 0 ]; then #Error - unwind & exit
+    echo "Error: Failed to change $MESG in '$DEVREGISTRY', unwinding..."
+    restore_backups
+    exit 6
+fi
+echo "   CHANGED $MESG in '$DEVREGISTRY'."
+
+print_exit
