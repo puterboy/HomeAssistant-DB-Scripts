@@ -29,7 +29,7 @@
 #    NOTE: NEW_DEVICE_NAME is used also to automatically update the unique_id by substituting it in place of the OLD_DEVICE_NAME where it occurs in the string
 #
 #===============================================================================
-# VERSION: 0.8.4
+# VERSION: 0.9.0
 #
 #===============================================================================
 # CHANGELOG
@@ -45,11 +45,13 @@
 #      - Bug fixes
 #     0.8.4 (July 2024)
 #      - Minor code tweak
+#     0.9.0 (February 2026)
+#      - Minor code tweak
 #
 #===============================================================================
 # AUTHOR:
 #    Jeff Kosowsky
-#    Copyright August 2024
+#    Copyright February 2026
 #
 #===============================================================================
 #### VARIABLES
@@ -74,7 +76,6 @@ DB="home-assistant_v2.db"
 ##Choose to undelete one of the following
 #BACKDIR="" #Set to blank if you don't want to backup data - not advisable
 #BACKDIR="/tmp/backups" #Temporary backup directory, deleted upon system reboot
-#BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *included* in standard HA backups
 BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *excluded* from standard HA backups
 
 if [ -n "$BACKDIR" ]; then
