@@ -1,73 +1,36 @@
 #!/bin/bash
 #===============================================================================
 # DESCRIPTION:
-# Delete devices and/or their corresponding entities *completely* from homeassistant
-# registries & databases
-#    - Delete devices '.storage' info from:
-#        core.device_registry
-#    - Delete entity '.storage' info from:
-#        core.entity_registry
-#        core.restore_state
-#        homeassistant.exposed_entities
-#    - Delete corresponding entity data from the following home-assistant_v2.db tables:
-#        states_meta
-#        states
-#        statistics_meta
-#        statistics
-#        statistics_short_term
-#        state_attributes
-#    - NOTE: Timestamped backups are (optionally) generated for every modified database or registry
-#    - NOTE: Devices marked by HA as 'deleted_devices' can only be accessed by id (-D), not by name
-#    - NOTE: MQTT devices (and associated entities) will be regenerated if their corresponding
-#            discovery topics are retained and not deleted
-#            So, you need to delete the corresponding topics from the 'homeassistant' tree
-#            e.g., use MQTT Explorer or 'mosquitto_sub' to delte the relevant discovery topics for
-#            each corresponding entity in the tree starting with the discovery_prefix (default: 'homeassistant)
-#            Until then, you may want to stop MQTT from re-adding any existing published
-#            entities *and* corresponding devices by turning off device discovery either
-#            in the MQTT integration gui or in configuration.yaml
-
-#===============================================================================
-# USAGE:
-#    Usage: delete_device+entity [-d DEV_NAME | -D DEV_ID | -e ENT_NAME | -E ENT_ID | -M metadata_id ] [-A] [-b BACKUP_DIR] [-x HA_BASE]
-#        where you need to specify exactly one of: -d, -D, -e, -E, -M
-#        If -d or -D specified OR -e or -E or -M plus -A specified, then
-#            the corresponding device and ALL its entities are deleted
-#        If -e or -E or -M specified with no '-A', then ONLY the specified entity is deleted
-    Usage: delete_device+entity [-d DEV_NAME | -D DEV_ID | -e ENT_NAME | -E ENT_ID | -M metadata_id ] [-A] [-b BACKUP_DIR] [-x HA_BASE]
-#        where you need to specify exactly one of: -d, -D, -e, -E, -M
-#        If -d or -D specified OR -e or -E or -M plus -A specified, then
-#            the corresponding device and ALL its entities are deleted
-#        If -e or -E or -M specified with no '-A', then ONLY the specified entity is deleted
-#        Note: '-x' is the location of the base homeassistant directory (default: /homeassistant)
-#        Note: '-x' is the location of the base homeassistant directory (default: /homeassistant)
+# Move statistic metadata_id's from: (X1, X2,..., Xn) --> (Y1, Y2,..., Yn)
+#
+# Moves statistic metadata_ids in tables:
+#    statistics_meta (id)
+#    statistics (metadata_id)
+#    statistics_short_term (metadata_id)
 #
 #===============================================================================
-# VERSION: 0.8.4
+# USAGE:
+#    Usage: move_statistics -i X1 X2... Xn -o Y1 Y2... Yn
+#
+#===============================================================================
+# VERSION: 0.9.0
 #
 #===============================================================================
 # CHANGELOG
-#     0.5.0 (June 2024)
-#       - First official release
-#     0.5.1 (June 2024)
-#       - Minor tweaks
+#     0.5 (June 2024)
+#      - First official release
 #     0.6 (July 2024)
-#      - Added ability to set backup directory
-#     0.7 (July 2024)
-#      - Improved backup/restore
-#      - Added renaming of dashboard entities
 #     0.8 (August 2024)
 #      - Minor cleanup
 #     0.8.1 (August 2024)
-#      - Added trap to remove tmpfile
+#      - Minor cleanup
 #     0.8.2 (December 2024)
-#      - Bug fixes
-#     0.8.3 (July 2024)
+#      - Added options for custom db and backup directory
 #      - Bug fixes
 #     0.8.4 (July 2024)
-#      - Added: -M metadata_id
-#     0.9 (February 2026)
-#      - Added 'y' as alternative answer to correct attributes
+#      - Optimized sqlite3 UPDATE statement
+#     0.9.0 (February 2026)
+#      - Fix usage to mention optionally specify database and backup directory
 #
 #===============================================================================
 # AUTHOR:
@@ -78,48 +41,26 @@
 #### VARIABLES
 
 BASE=/homeassistant
+BASE="${BASE%%/}"
+
 DB="home-assistant_v2.db"
+DB="$BASE/$DB"
 
 ##Choose to undelete one of the following
 #BACKDIR="" #Set to blank if you don't want to backup data - not advisable
-#BACKDIR="/tmp/backups" #Temporary backup directory, deleted upon system reboot
+BACKDIR="/tmp/backups" #Temporary backup directory, deleted upon system reboot
 BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *excluded* from standard HA backups
-
-if [ -n "$BACKDIR" ]; then
-    BACKDIR=${BACKDIR%%+(/)} #Remove all trailing slashes
-    mkdir -p "$BACKDIR" || exit 2
-fi
-
-TMPFILE=$(mktemp /tmp/HAtempbak.XXXXXXX)
-trap 'rm -f $TMPFILE' EXIT INT TERM QUIT
-
-DEVREGISTRY=core.device_registry
-ENTREGISTRY=core.entity_registry
-RESTORESTATE=core.restore_state
-EXPOSEDENTITIES=homeassistant.exposed_entities
 
 #===============================================================================
 #### FUNCTIONS
 
 usage() {
-    PROG=${0##*/}    
+    PROG=${0##*/}
     cat <<EOF >&2
-Usage: $PROG [-d DEV_NAME | -D DEV_ID | -e ENT_NAME | -E ENT_ID | -M METADATA_ID ] [-A] [-b BACKUP_DIR] [-x HA_BASE]
-    where you need to specify exactly one of: -d, -D, -e, -E, -M
-        If -d or -D specified OR -e or -E or -M plus -A specified, then
-            the corresponding device and all its entities are deleted
-        If -e or -E or -M specified with no '-A', then the specified entity alone is deleted
+Usage: $PROG -i X1 X2... Xn -o Y1 Y2... Yn
 EOF
     exit 1
     }
-
-myjoin() {
-    local separator="$1"
-    shift
-    local first="$1"
-    shift
-    printf "%s" "$first" "${@/#/$separator}"
-}
 
 print_exit() {
     [ -n "$RESTART_HA" ] && echo "*** Don't forget to restart home assistant (ha core start)"
@@ -154,95 +95,75 @@ restore_backups() {
 	    echo "ERROR: Can't restore '$BACK' to '$SRC' since '$BACK' DOESN'T exist"
 	fi
     done
-    rm -f "$TMPFILE"
 }
 
 #===============================================================================
-####PARSE OPTIONS
+#### PARSE OPTIONS
 
-NUMDEV=0
-while getopts Ab:d:D:e:E:hx:M: options; do
-    case "${options}" in
-	A) ALL=1
+OPTi='-i'
+OPTo='-o'
+declare -a INSTATES OUTSTATES
+declare -A UNIQ
+while [ -n "$1" ]; do
+    case "$1" in    
+    	$OPTi)	OPT=i
+		unset OPTi
+		index=0
+		STATES=INSTATES
+		shift
+		;;
+	$OPTo) OPT=o
+	       unset OPTo
+	       index=0
+	       STATES=OUTSTATES
+	       shift
+	       ;;
+	[0-9]*) declare "${STATES}[$index]=$1" #Indirect referencing
+		((index++))
+		if [ -n "${UNIQ[$1]}" ]; then
+		    echo "Error: Can't have duplicate metadata_id's"
+		    exit 1
+		fi
+		UNIQ[$1]=$1
+		shift
+		;;
+	-d) shift
+	   DB="$1"
+	   shift
 	   ;;
-	b) BACKDIR="${OPTARG}"
+	-b) shift
+	   BACKDIR="$1"
+	   shift
 	   ;;
-	d) DEVNAME=${OPTARG}
-	    ((NUMDEV++))
-	    ;;
-	D) DEVID=${OPTARG}
-	   if [[ ! "$DEVID" =~ ^[[:xdigit:]]{32}$ ]]; then
-	       echo "Error: DEV_ID must be 32 char hex" >&2
-	       usage
-	   fi
-	   ((NUMDEV++))
+	-h) usage
 	   ;;
-	e) ENTNAME=${OPTARG}
-	   ((NUMDEV++))
-	   ;;
-	E) ENTID=${OPTARG}
-	   ((NUMDEV++))
-	    if [[ ! "$ENTID" =~ ^[[:xdigit:]]{32}$ ]]; then
-		echo "Error: ENT_ID must be 32 char hex" >&2
-		usage
-	    fi	
-	    ;;
-	M) METID=${OPTARG}
-	   ((NUMDEV++))
-	    if [[ ! "$METID" =~ ^[1-9][0-9]*$ ]]; then
-		echo "Error: METADATA_ID must be a positive digit" >&2
-		usage
-	    fi	
-	    ;;	
-	x) BASE="${OPTARG}"
-	   ;;
-	:) echo "Error: -${OPTARG} requires an argument." >&2
-	   usage
-	   ;;
-	h|*) usage
+	*) usage
 	   ;;
     esac
 done
 
-BASE="${BASE%%/}"
-DB="$BASE/$DB"
-STORAGE="$BASE/.storage"
+if [ ${#INSTATES[@]} -eq 0 -o ${#INSTATES[@]} -ne ${#OUTSTATES[@]} ]; then
+    echo "Error: must have same (positive) number of input and output metadata_id's"
+    exit 1
+fi
 
 if ! [ -f "$DB" ]; then
     echo "Error: Can't find database file '$DB'"
-    exit 3
-fi
-if ! [ -d "$STORAGE" ]; then
-    echo "Error: Can't find storage directory '$STORAGE'"
-    exit 3
+    exit 2
 fi
 
-if [[ $NUMDEV -ne 1 || -n "$ALL" && !( -n "$ENTID" || -n "$ENTNAME" || -n "$METID" ) ]]; then
-    echo "Error: Need to enter exactly one type option (-d, -D, -e, -E, -M) plus optional '-A' if entity specified" >&2
-    usage
+if [ -n "$BACKDIR" ]; then
+    BACKDIR=${BACKDIR%%+(/)} #Remove all trailing slashes
+    mkdir -p "$BACKDIR" || exit 3
 fi
-shift $((OPTIND-1))
-[ -n "$1" ] && usage #No other arguments
+
+#===============================================================================
+#### Sanity Checks
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Must be root to run!"
     exit 1
 fi
-
-#===============================================================================
-#### FILE CHECKS
-if ! [ -e "$DB" ]; then
-    echo "Error: Can't find database '$DB'..." >&2
-    exit 4
-fi
-
-if ! [ -d "$STORAGE" ]; then
-    echo "Error: Can't find storage directory '$STORAGE'..." >&2
-    exit 5
-fi
-
-#===============================================================================
-#### Get device and entity data
 
 #Stop Home Assistant before querying & changing databases if HA running and operating on live database
 if `which ha >/dev/null` && [ "$(readlink -f "$DB")" = "$(readlink -f "/homeassistant/home-assistant_v2.db")" ]; then
@@ -252,282 +173,84 @@ if `which ha >/dev/null` && [ "$(readlink -f "$DB")" = "$(readlink -f "/homeassi
        ha core stop >&/dev/null
        if [ $? -ne 0 ]; then
 	   echo "Error: Couldn't stop home assistant..."
-	   exit 6
+	   exit 4
        fi
        RESTART_HA=1
    fi
 fi
 
-cd $STORAGE
-echo "DB: $DB"
-echo "BACKDIR: ${BACKDIR:-<No backup>}"
-echo
+numstates=($(for id in ${OUTSTATES[@]}; do
+		 echo "SELECT 1 FROM statistics_meta WHERE id = $id LIMIT 1;"
+		 echo "SELECT 1 FROM statistics WHERE metadata_id = $id LIMIT 1;"
+		 echo "SELECT 1 FROM statistics_short_term WHERE metadata_id = $id LIMIT 1;"
+	     done | sqlite3 "$DB"))
 
-#Get metadata_id for state and statistics tables from $DB
-declare -A METADATA #Associative array for state metadata id: entity_id -> metadata_id
-while IFS='|' read meta entity; do
-    METADATA["$entity"]="$meta"
-done <<< $(sqlite3 "$DB" "SELECT metadata_id, entity_id FROM states_meta")
-#for id in ${!METADATA[@]}; do echo "$id ---> ${METADATA[$id]}"; done #DEBUG
-
-declare -A METADATA_STAT #Associative array for statistic metadata id: statistic_id -> id
-while IFS='|' read id statistic; do
-    METADATA_STAT["$statistic"]="$id"
-done <<< $(sqlite3 "$DB" "SELECT id, statistic_id FROM statistics_meta")
-#for id in ${!METADATA_STAT[@]}; do echo "$id ---> ${METADATA_STAT[$id]}"; done #DEBUG
-
-## Get ENTNAME from METID if METID given
-if [ -n "$METID" ]; then
-    ENTNAME=$(sqlite3 "$DB" "SELECT entity_id FROM states_meta WHERE metadata_id = $METID")
-    if [ -z "$ENTNAME" ]; then
-	echo "Error: Can't find entity_id corresponding to metadata_id: $METID" >&2
-	exit 7
-    fi
+if [ ${#numstates[@]} -ne 0 ]; then
+   echo "Error: some of the intended output metadata_id's are already in use!" 2>&1
+   exit 5
 fi
 
-## Get Device id & Name
-if [ -n "$ALL" ]; then #Find device containing entity if '-e' or '-E' or '-M' together with '-A' specified
-    if [ -n "$ENTID" ]; then
-	DEVID=$(cat $ENTREGISTRY | jq -M 'limit(1; .data.entities[], .data.deleted_entities[] | select(.id == "'"$ENTID"'") | .device_id)' | tr -d \" 2>/dev/null)
-    elif [ -n "$ENTNAME" ]; then
-	DEVID=$(cat $ENTREGISTRY | jq -M 'limit(1; .data.entities[], .data.deleted_entities[] | select(.entity_id == "'"$ENTNAME"'") | .device_id)' | tr -d \" 2>/dev/null)
-    fi
-    if [ -z "$DEVID" ]; then
-	echo "Error: Can't find device id corresponding to entity '${ENTID:-$ENTNAME}' in '$DEVREGISTRY'" >&2
-	exit 8
-    fi
-    unset ENTID ENTNAME
-fi
+numstates=($(for id in ${INSTATES[@]}; do
+		 echo "SELECT 1 FROM statistics_meta WHERE id = $id LIMIT 1;"
+	     done | sqlite3 "$DB"))
 
-if [ -n "$DEVID" ]; then #Look up by DEVID
-    { read -r DEVNAME; read -r  DEVUSERNAME; } \
-	<<< $(cat $DEVREGISTRY | jq -M '.data.devices[], .data.deleted_devices[] | select(.id == "'"$DEVID"'") | .name, .name_by_user' | tr -d \" 2>/dev/null)
-
-    if [ -z "$DEVNAME" ]; then
-	echo "Error: Can't find device id '$DEVID' in '$DEVREGISTRY'" >&2
-	exit 9
-    fi
-elif [ -n "$DEVNAME" ]; then  #Look up by DEVNAME
-    { read -r DEVID; read -r  DEVUSERNAME; } \
-	<<< $(cat $DEVREGISTRY | jq -M '.data.devices[], .data.deleted_devices[] | select(.name == "'"$DEVNAME"'") | .id, .name_by_user' | tr -d \" 2>/dev/null)
-
-    if [ -z "$DEVID" ]; then
-	echo "Error: Can't find device name '$DEVNAME' in '$DEVREGISTRY'" >&2
-	exit 10
-    fi
-fi
-
-#Get Entity id's and associated info
-if [ -n "$ENTID" ]; then
-    ENT_IDS=($ENTID)
-    if [ -z "$(cat $ENTREGISTRY | jq -c -M '.data.entities[], .data.deleted_entities[] | select(.id == "'"$ENTID"'")')" ]; then
-	echo "Error: Can't find '$ENTID' in '$ENTREGISTRY'" >&2
-	exit 11
-    fi
-elif [ -n "$ENTNAME" ]; then
-    ENT_IDS=($(cat $ENTREGISTRY | jq -M '.data.entities[], .data.deleted_entities[] | select(.entity_id == "'"$ENTNAME"'") | .id' | tr -d \" 2>/dev/null))
-    if [ ${#ENT_IDS[@]} -eq 0 ]; then
-	echo "Error: Can't find any entities corresponding to '$ENTNAME' in '$ENTREGISTRY'" >&2
-	exit 12
-    fi
-else #Device + Entities
-    echo -e "Device: Name: $DEVNAME [$DEVID]\tUser name: $DEVUSERNAME"
-
-    #Get Corresponding Entity id's
-    ENT_IDS=($(cat $ENTREGISTRY | jq -M '.data.entities[], .data.deleted_entities[] | select(.device_id == "'"$DEVID"'") | .id' | tr -d \" 2>/dev/null))
-    if [ ${#ENT_IDS[@]} -eq 0 ]; then
-	echo -n "Can't find any entities corresponding to '$DEVNAME' ($DEVID) in '$ENTREGISTRY'. Delete device anyway? (y/n) " >&2
-	read -e ANSWER
-	echo
-	if [ "$ANSWER" != "y" ]; then
-	    echo "Aborting..."
-	    exit 13
-	fi
-    fi
-fi
-#for id in ${ENT_IDS[@]}; do echo "|$id|"; done #DEBUG
-
-[ ${#ENT_IDS[@]} -ne 0 ] && printf "\n%-32s %-7s %-7s %-20s %-20s %-20s\n" ID META_ID STAT_ID ENTITY_ID "(UNIQUE_ID)" "[ORIGINAL_NAME]"
-for id in ${ENT_IDS[@]}; do
-    #Note first need to declare assoc arrays since index is hex and can be interpeted as numbered base for an indexed array
-    declare -A ENTIDNAMES[$id] ENTUIDS[$id] ENTORIGNAMES[$id] METAIDS[$id] METASTATIDS[$id]
-
-    { read -r entity_id; read -r  unique_id; read -r  original_name; } \
-	<<< $(cat $ENTREGISTRY | jq -M '.data.entities[], .data.deleted_entities[] | select(.id == "'"$id"'") | .entity_id, .unique_id, .original_name' | tr -d \")
-
-    ENTIDNAMES[$id]=$entity_id
-    ENTUIDS[$id]=$unique_id
-    ENTORIGNAMES[$id]=$original_name
-    METAIDS[$id]=${METADATA["$entity_id"]}
-    [ -z "${METAIDS[$id]}" ] && METAIDS[$id]='-'
-    METASTATIDS[$id]=${METADATA_STAT["$entity_id"]}
-    [ -z "${METASTATIDS[$id]}" ] && METASTATIDS[$id]='-'
-
-    printf "%s %-7s %-7s %s (%s) [%s]\n" "$id" "${METAIDS[$id]}" "${METASTATIDS[$id]}" "${ENTIDNAMES[$id]}" "${ENTUIDS[$id]}" "${ENTORIGNAMES[$id]}"
-    [ "${METAIDS[$id]}" = '-' ] && echo -e "     WARNING: No 'metadata_id' stored in database for $entity_id\n"
-done
-
-echo -ne "\nAre you sure you want to COMPLETELY delete the above ${DEVID:+device &} ${#ENT_IDS[@]} entities (including all associated db data)?(y/n) " >&2
-read -e ANSWER
-echo
-if [ "$ANSWER" != "y" ]; then
-    echo "Aborting..."
-    exit 14
+if [ ${#numstates[@]} -ne ${#INSTATES[@]}  ]; then
+   echo "Error: Some of the listed input metadata_id's don't exist" 2>&1
+   exit 6
 fi
 
 #===============================================================================
-#### Delete entries in '.storage' registries
-
-### Delete entry in $DEVREGISTRY (core.device_registry) if device selected
-if [ -n "$DEVID" ]; then
-    backup $DEVREGISTRY
-    cp -f $DEVREGISTRY $TMPFILE
-    cat $TMPFILE | jq -M '.data |= del(.devices[], .deleted_devices[] | select(.id == "'"$DEVID"'"))' >| $DEVREGISTRY
-    if [ $? -ne 0 ]; then #Error - unwind & exit
-	echo "Error: Failed to delete *device* entries from '$DEVREGISTRY', unwinding..."
-	restore_backups
-	exit 15
-    fi
-    echo "   DELETED *device* entries from '$DEVREGISTRY'"
-fi
-
-if [ ${#ENT_IDS[@]} -eq 0 ];then #Device only so exit
-    print_exit
-    exit 0
-fi
-
-### Delete entries in $ENTREGISTRY (core.entity_registry)
-backup $ENTREGISTRY
-ENTJOINS=".entity_id == \"$(myjoin "\" or .entity_id == \"" ${ENTIDNAMES[@]})\"" #Selection string for all entities
-cp -f $ENTREGISTRY $TMPFILE
-cat $TMPFILE | jq -M '.data |= del(.entities[], .deleted_entities[] | select('"$ENTJOINS"'))' >|  $ENTREGISTRY
-if [ $? -ne 0 ]; then #Error - unwind & exit
-    echo "Error: Failed to delete *entity* entries from '$ENTREGISTRY', unwinding..."
-    restore_backups
-    exit 16
-fi
-echo "   DELETED *entity* entries from '$ENTREGISTRY'"
-
-### Delete entries in $RESTORESTATE (core.restore_state)
-ENTJOINS=".state.entity_id == \"$(myjoin "\" or .state.entity_id == \"" ${ENTIDNAMES[@]})\"" #Selection string for all entities
-if [ -n "$(cat $RESTORESTATE | jq -c -M '.data[] | select('"$ENTJOINS"')')" ]; then #Entry exists in 'core.restore_state'
-    backup $RESTORESTATE
-    cp -f $RESTORESTATE $TMPFILE
-    cat $TMPFILE | jq -M '.data |= del(.[] | select('"$ENTJOINS"'))' >| $RESTORESTATE
-    if [ $? -ne 0 ]; then #Error - unwind & exit
-	echo "Error: Failed to delete *entity* entries from '$RESTORESTATE', unwinding..."
-	restore_backups
-	exit 17
-    fi
-    echo "   DELETED *entity* entries from '$RESTORESTATE'"
-fi
-
-### Delete entries in $EXPOSEDENTITIES(homeassistant.exposed_entities)
-ENTJOINS=".\"$(myjoin "\", .\"" ${ENTIDNAMES[@]})\"" #Selection string for all entities
-if [ "$(cat $EXPOSEDENTITIES | jq -c -M '.data.exposed_entities | select('"$ENTJOINS"')')" != "null" ]; then #Entry exist in 'home-assistant.exposed_entities'
-    backup $EXPOSEDENTITIES
-    cp -f $EXPOSEDENTITIES $TMPFILE
-    cat $TMPFILE | jq -M '.data |= del(.exposed_entities | select('"$ENTJOINS"'))' >| ${EXPOSEDENTITIES}
-    if [ $? -ne 0 ]; then #Error - unwind & exit
-	echo "Error: Failed to delete *entity* entries from '$EXPOSEDENTITIES', unwinding..."
-	restore_backups
-	exit 18
-    fi
-    echo "   DELETED *entity* entries from '$EXPOSEDENTITIES'"
-fi
-
-#===============================================================================
-#### Delete entries in 'home-assistant_v2.db'
+#### Move metadata_id's
 
 backup "$DB"
+echo "Number of entries moved in 'statistics' and 'statistics_short_term' table:"
+for ((i=0; i<${#INSTATES[@]}; i++)); do
+    sqlite3 "$DB" "BEGIN TRANSACTION;
+    	    	     UPDATE statistics_meta 
+		       SET id = '${OUTSTATES[$i]}'
+		       WHERE id = '${INSTATES[$i]}';
+                   COMMIT;"
 
-#Needed later (NOTE: 'comm' needs lexicographical sort so cast id's as text)
-ATTRIBUTES_USED_ORIG="$(sqlite3 "$DB" "SELECT DISTINCT attributes_id FROM states ORDER BY CAST(attributes_id AS text)")"
-
-if [[ ! $(IFS=; echo "${METAIDS[*]}")  =~ ^-*$ ]]; then # Entry exists in 'states_meta' (if doesn't Consists only of '-')
-    METAIDJOINS="metadata_id = '$(myjoin "' OR metadata_id = '" ${METAIDS[@]})'"
-    NUMDELS=$(sqlite3 "$DB" "DELETE FROM states_meta WHERE $METAIDJOINS; SELECT changes()")
     if [ $? -ne 0 ]; then #Error - unwind & exit
-	echo "Error: Failed to delete entities from 'states_meta' table, unwinding..."
-	restore_backups
-	exit 19
+	echo "Error: ${INSTATES[$i]}->${OUTSTATES[$i]}: Failed to change statistics 'metadata_id', unwinding..."
+	#restore_backups #No need to restore backups because if fails won't commit
+	exit 7
     fi
-    echo "   DELETED $NUMDELS entries from 'states_meta' table"
+    NUM=$(sqlite3 "$DB" "
+    		  PRAGMA synchronous = NORMAL;
+		  PRAGMA temp_store = MEMORY;
+		  PRAGMA foreign_keys = OFF;
 
-    NUMDELS=$(sqlite3 "$DB" "DELETE FROM states WHERE $METAIDJOINS; SELECT changes()")
+		  BEGIN TRANSACTION;
+		    UPDATE statistics 
+		      SET metadata_id = '${OUTSTATES[$i]}'
+		      WHERE metadata_id = '${INSTATES[$i]}';
+		    SELECT changes();
+    		  COMMIT;
+	 ")    
     if [ $? -ne 0 ]; then #Error - unwind & exit
-	echo "Error: Failed to delete entries for deleted entities from 'states' table, unwinding..."
+	echo "Error: ${INSTATES[$i]}->${OUTSTATES[$i]}: Failed to update 'statistics' entries, unwinding..."
 	restore_backups
-	exit 20
-    fi
-    echo "   DELETED $NUMDELS entries from 'states' table"
-fi
+	exit 8
+    fi    
+    NUM_SHORT=$(sqlite3 "$DB" "
+    		  PRAGMA synchronous = NORMAL;
+		  PRAGMA temp_store = MEMORY;
+		  PRAGMA foreign_keys = OFF;
 
-if [[ ! $(IFS=; echo "${METASTATIDS[*]}")  =~ ^-*$ ]]; then # Entry exists in 'statistics_meta' (if doesn't Consists only of '-')
-    IDSTATJOINS="id = '$(myjoin "' OR id = '" ${METASTATIDS[@]})'"
-    NUMDELS=$(sqlite3 "$DB" "DELETE FROM statistics_meta WHERE $IDSTATJOINS; SELECT changes()")
-    echo "   DELETED $NUMDELS entries from 'statistics_meta' table"
+		  BEGIN TRANSACTION;
+		    UPDATE statistics_short_term
+		      SET metadata_id = '${OUTSTATES[$i]}'
+		      WHERE metadata_id = '${INSTATES[$i]}';
+		      SELECT changes();
+    		      COMMIT;
+	 ")    
     if [ $? -ne 0 ]; then #Error - unwind & exit
-	echo "Error: Failed to delete entities from 'statistics_meta' table, unwinding..."
+	echo "Error: ${INSTATES[$i]}->${OUTSTATES[$i]}: Failed to update 'statistics_short_term' entries, unwinding..."
 	restore_backups
-	exit 21
+	exit 9
     fi
+    echo -e "${INSTATES[$i]}->${OUTSTATES[$i]}: $NUM\t$NUM_SHORT"
+done
 
-    METAIDSTATJOINS="metadata_id = '$(myjoin "' OR metadata_id = '" ${METASTATIDS[@]})'"
-    NUMDELS=$(sqlite3 "$DB" "DELETE FROM statistics WHERE $METAIDSTATJOINS; SELECT changes()")
-    if [ $? -ne 0 ]; then #Error - unwind & exit
-	echo "Error: Failed to delete entries for deleted entities from 'statistics' table, unwinding..."
-	restore_backups
-	exit 22
-    fi
-    echo "   DELETED $NUMDELS entries from 'statistics' table"
-
-    NUMDELS=$(sqlite3 "$DB" "DELETE FROM statistics_short_term WHERE $METAIDSTATJOINS; SELECT changes()")
-    if [ $? -ne 0 ]; then #Error - unwind & exit
-	echo "Error: Failed to delete entries for deleted entities from 'statistics_short_term' table, unwinding..."
-	restore_backups
-	exit 23
-    fi
-    echo "   DELETED $NUMDELS entries from 'statistics_short_term' table"
-fi
-
-#===============================================================================
-#### Delete orphaned entries in 'states_attributes' database
-
-#NOTE: 'comm' needs lexicographical sort
-ATTRIBUTES_USED="$(sqlite3 "$DB" "SELECT DISTINCT attributes_id FROM states ORDER BY CAST(attributes_id AS text)")"
-ATTRIBUTES_ALL="$(sqlite3 "$DB" "SELECT attributes_id FROM state_attributes ORDER BY CAST(attributes_id AS text)")"
-
-NEWLY_ORPHANED=($(comm -2 -3 <(echo "$ATTRIBUTES_USED_ORIG") <(echo "$ATTRIBUTES_USED")))
-ALL_ORPHANED=($(comm -2 -3 <(echo "$ATTRIBUTES_ALL") <(echo "$ATTRIBUTES_USED")))
-MISSING=($(comm -1 -3 <(echo "$ATTRIBUTES_ALL") <(echo "$ATTRIBUTES_USED")))
-
-echo "There are '${#NEWLY_ORPHANED[@]}' NEWLY orphaned attributes and '${#ALL_ORPHANED[@]}' TOTAL orphaned attributes in 'state_attributes' table"
-echo "(Also, there are ${#MISSING[@]} attributes that are referenced in 'states' but not found in 'state_attributes table)"
-
-if [ ${#ALL_ORPHANED} -gt 0 ]; then
-    echo -ne "\nDelete orphaned attributes from 'state_attributes' table?([y]es, new orphans only / [a]ll orphans / [n]o, abort) " >&2
-    read -e ANSWER
-    echo
-    case $ANSWER in
-	y) DELATTRS="$(myjoin ',' "${NEWLY_ORPHANED[@]}")"
-	   ;;
-	a) DELATTRS="$(myjoin ',' "${ALL_ORPHANED[@]}")"
-	   ;;
-	*) DELATTRS=""
-	   ;;
-    esac
-    if [ -n "$DELATTRS" ]; then
-	NUMDELS=$(sqlite3 "$DB" "DELETE FROM state_attributes WHERE attributes_id IN ($DELATTRS); SELECT changes()")
-	if [ $? -ne 0 ]; then #Error - unwind & exit
-	    echo "Error: Failed to delete orphaned attributeses from 'state_attributes' table, unwinding..."
-	    restore_backups
-	    exit 24
-	fi
-	echo "   DELETED $NUMDELS entries from 'state_attributes' table"
-    fi	
-fi
-
-#===============================================================================
-echo -e "\n***If device/entities are MQTT integrations, don't forget to unpublish the entities!"
 print_exit
