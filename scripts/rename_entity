@@ -91,7 +91,6 @@ YAML_FILES=("${YAML_FILES_BASIC[@]}" "${YAML_FILES_ADDED[@]}")
 ##Choose to undelete one of the following
 #BACKDIR="" #Set to blank if you don't want to backup data - not advisable
 #BACKDIR="/tmp/backups" #Temporary backup directory, deleted upon system reboot
-#BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *included* in standard HA backups
 BACKDIR="/backup/backdir" #Permanent (new) backup directory that is *excluded* from standard HA backups
 
 if [ -n "$BACKDIR" ]; then
