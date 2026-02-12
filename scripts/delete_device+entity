@@ -34,16 +34,12 @@
 #        If -d or -D specified OR -e or -E or -M plus -A specified, then
 #            the corresponding device and ALL its entities are deleted
 #        If -e or -E or -M specified with no '-A', then ONLY the specified entity is deleted
-    Usage: delete_device+entity [-d DEV_NAME | -D DEV_ID | -e ENT_NAME | -E ENT_ID | -M metadata_id ] [-A] [-b BACKUP_DIR] [-x HA_BASE]
-#        where you need to specify exactly one of: -d, -D, -e, -E, -M
-#        If -d or -D specified OR -e or -E or -M plus -A specified, then
-#            the corresponding device and ALL its entities are deleted
-#        If -e or -E or -M specified with no '-A', then ONLY the specified entity is deleted
+#
 #        Note: '-x' is the location of the base homeassistant directory (default: /homeassistant)
 #        Note: '-x' is the location of the base homeassistant directory (default: /homeassistant)
 #
 #===============================================================================
-# VERSION: 0.8.4
+# VERSION: 0.9.0
 #
 #===============================================================================
 # CHANGELOG
