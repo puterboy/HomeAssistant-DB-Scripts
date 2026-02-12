@@ -202,7 +202,7 @@ similar entities together (in particular all the entities for a given device)
 
 #### Usage
 ```
-move_states -i X1 X2... Xn -o Y1 Y2... Yn
+move_states [-b BACKUP_DIR] [-d HA_DATABASE] -i X1 X2... Xn -o Y1 Y2... Yn
 ```
 
 #### HA DB tables affected
@@ -223,7 +223,7 @@ similar entities together (in particular all the entities for a given device)
 
 #### Usage
 ```
-Usage: move_statistics -i X1 X2... Xn -o Y1 Y2... Yn
+Usage: move_statistics [-b BACKUP_DIR] [-d HA_DATABASE] -i X1 X2... Xn -o Y1 Y2... Yn
 ```
 
 #### HA DB tables affected
